@@ -21,7 +21,8 @@ modes) live in [docs/ops.md](docs/ops.md).
 - **Single static binary**, single data directory, POSIX-only.
 - **Crash-safe**: writes survive `kill -9` when `--sync-on-put` is on
   (see [§ Durability and fsync](#durability-and-fsync)).
-- **API**: `Put`, `Get`, `Delete`, `BatchPut`, `ReadKeyRange`, `Stats`.
+- **API**: `Put`, `Get`, `Delete`, `BatchPut`, `ReadKeyRange`,
+  `CompareAndSwap`, `Stats`.
 - **Wire**: framed binary protocol over TCP (see
   [docs/SPEC.md §5](docs/SPEC.md)).
 - **No external dependencies** at runtime or build time.
@@ -69,6 +70,7 @@ recipes — lives in [docs/cli.md](docs/cli.md).
 | `put`      | Write one key (positional VALUE or `--value-stdin`).     |
 | `get`      | Read one key to stdout (raw bytes).                      |
 | `delete`   | Tombstone one key.                                       |
+| `cas`      | Conditional write (`--if-absent`, or value compare-and-swap); exit `6` on a failed precondition. |
 | `range`    | Stream `[--start, --end)` to stdout (`ndjson` or `raw`). |
 | `batch`    | Atomic multi-op from NDJSON (`--plain` or base64).       |
 | `stats`    | `key_count=… bytes_on_disk=…`.                           |
@@ -94,7 +96,8 @@ little-db batch --plain - < testdata/users.10k.ndjson
 ```
 
 Exit codes: `0` ok · `1` transport · `2` usage · `3` server bad/internal
-· `4` not found · `5` overload/closed. See
+· `4` not found · `5` overload/closed · `6` precondition failed
+(`cas`). See
 [docs/cli.md](docs/cli.md#exit-codes) for the full table.
 
 ### Loading a JSON file

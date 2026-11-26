@@ -29,6 +29,18 @@
 //	                       slen=0 means "open start"; elen=0 means "open end"
 //	0x06 PING            (empty body)
 //	0x07 STATS           (empty body)
+//	0x08 CAS             u32 klen | key | u8 mode | u32 vlen | newval |
+//	                       u32 elen | expect
+//	                       mode=1 (CAS_IF_ABSENT): elen MUST be 0 (no
+//	                         expect bytes); applies only when the key
+//	                         currently has no live value.
+//	                       mode=2 (CAS_IF_VALUE): elen may be zero (an
+//	                         empty expected value matches a live key whose
+//	                         value is empty — NOT an absent key); applies
+//	                         only when the live value byte-equals expect.
+//	                       A failed precondition answers with
+//	                       PRECONDITION_FAILED (a normal unapplied result,
+//	                       not a protocol error).
 //
 // Statuses (response tags):
 //
@@ -38,6 +50,7 @@
 //	0x03 INTERNAL
 //	0x04 CLOSED
 //	0x05 OVERLOAD
+//	0x06 PRECONDITION_FAILED
 //
 // Non-OK responses carry an error envelope as their body:
 //
@@ -103,6 +116,25 @@ const (
 	// RangeEndSentinel, which still allows ~4 billion pairs per page —
 	// well above any realistic page that fits inside MaxFramePayload.
 	RangeEndSentinel uint32 = 0xFFFFFFFF
+
+	// minCASBodyBytes is the smallest legal CAS body: u32 klen + 1-byte
+	// key + u8 mode + u32 vlen (vlen=0) + u32 elen (elen=0) = 14. It is
+	// used as a cheap truncated-input guard before any field is read.
+	minCASBodyBytes = 4 + 1 + 1 + 4 + 4
+)
+
+// CASMode selects the precondition shape of a CAS request.
+type CASMode uint8
+
+const (
+	// CASIfAbsent applies only when the key currently has no live value.
+	// The expected-value field must be empty.
+	CASIfAbsent CASMode = 1
+
+	// CASIfValue applies only when the key exists and its current value
+	// byte-equals the request's expected value. An empty expected value
+	// matches a live empty value, never an absent key.
+	CASIfValue CASMode = 2
 )
 
 // Op is a request opcode.
@@ -116,6 +148,7 @@ const (
 	OpReadKeyRange Op = 0x05
 	OpPing         Op = 0x06
 	OpStats        Op = 0x07
+	OpCAS          Op = 0x08
 )
 
 // String returns a stable name for the opcode, useful for log lines.
@@ -135,6 +168,8 @@ func (o Op) String() string {
 		return "PING"
 	case OpStats:
 		return "STATS"
+	case OpCAS:
+		return "CAS"
 	default:
 		return "UNKNOWN"
 	}
@@ -144,12 +179,13 @@ func (o Op) String() string {
 type Status uint8
 
 const (
-	StatusOK         Status = 0x00
-	StatusNotFound   Status = 0x01
-	StatusBadRequest Status = 0x02
-	StatusInternal   Status = 0x03
-	StatusClosed     Status = 0x04
-	StatusOverload   Status = 0x05
+	StatusOK                 Status = 0x00
+	StatusNotFound           Status = 0x01
+	StatusBadRequest         Status = 0x02
+	StatusInternal           Status = 0x03
+	StatusClosed             Status = 0x04
+	StatusOverload           Status = 0x05
+	StatusPreconditionFailed Status = 0x06
 )
 
 // String returns a stable name for the status.
@@ -167,6 +203,8 @@ func (s Status) String() string {
 		return "CLOSED"
 	case StatusOverload:
 		return "OVERLOAD"
+	case StatusPreconditionFailed:
+		return "PRECONDITION_FAILED"
 	default:
 		return "UNKNOWN"
 	}

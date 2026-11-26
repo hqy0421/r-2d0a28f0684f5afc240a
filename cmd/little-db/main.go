@@ -3,6 +3,11 @@
 // (`put`/`get`/`delete`/`range`/`batch`/`stats`/`ping`) that drive the
 // TCP server over the Go client.
 //
+// Package main is the little-db CLI binary. It exposes one server
+// subcommand (`serve`) and a set of data-plane subcommands
+// (`put`/`get`/`delete`/`cas`/`range`/`batch`/`stats`/`ping`) that drive
+// the TCP server over the Go client.
+//
 // Exit codes:
 //
 //	0  success
@@ -11,6 +16,7 @@
 //	3  remote BAD_REQUEST or INTERNAL
 //	4  remote NOT_FOUND (Get / Delete returning a missing key)
 //	5  remote OVERLOAD or CLOSED
+//	6  cas precondition failed (a normal unapplied conditional write)
 //
 // The package keeps an internal `run(args, stdin, stdout, stderr) int`
 // entry point so end-to-end tests can drive the CLI in-process without
@@ -33,12 +39,13 @@ import (
 )
 
 const (
-	exitOK         = 0
-	exitTransport  = 1
-	exitUsage      = 2
-	exitRemoteBad  = 3
-	exitNotFound   = 4
-	exitOverloaded = 5
+	exitOK               = 0
+	exitTransport        = 1
+	exitUsage            = 2
+	exitRemoteBad        = 3
+	exitNotFound         = 4
+	exitOverloaded       = 5
+	exitPreconditionFail = 6
 
 	defaultAddr           = "127.0.0.1:4242"
 	defaultDialTimeout    = 5 * time.Second
@@ -67,6 +74,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runGet(rest, stdout, stderr)
 	case "delete":
 		return runDelete(rest, stderr)
+	case "cas":
+		return runCAS(rest, stdin, stderr)
 	case "range":
 		return runRange(rest, stdout, stderr)
 	case "batch":
@@ -93,6 +102,7 @@ Subcommands:
   put      PUT a key=value
   get      GET a key
   delete   DELETE a key
+  cas      Conditional write (compare-and-swap / put-if-absent)
   range    Stream a key range
   batch    Submit a batch (NDJSON on stdin with "-")
   stats    Print server stats

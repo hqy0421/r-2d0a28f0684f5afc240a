@@ -6,6 +6,18 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Conditional writes: `engine.DB.CompareAndSwap` (value-based
+  compare-and-swap and insert-if-absent), exposed over the wire as the
+  `CAS` opcode (`0x08`) with a new `PRECONDITION_FAILED` status
+  (`0x06`), via `client.Client.CompareAndSwap` / `PutIfAbsent`, and the
+  `little-db cas` CLI subcommand (new exit code `6`). The precondition
+  check and append are one writer step, so concurrent same-old-value
+  writes linearize to exactly one winner; a conflict appends nothing
+  and is reported as a normal unapplied result. Absent-key and
+  present-empty-value are distinct preconditions, and only the winning
+  write is visible after reopen.
+
 ## [0.1.0] - 2026-05-28
 
 Initial public release.

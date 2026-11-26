@@ -40,6 +40,8 @@ their bytes between the API call and the platter.
 - Background compaction with hint files.
 - Crash recovery on `Open`.
 - The five required API operations: `Put`, `Read`, `ReadKeyRange`, `BatchPut`, `Delete`.
+- A conditional write (`CompareAndSwap`, §4.6) so independent writers
+  can update a key without silently overwriting each other's decisions.
 - TCP server with a custom length-prefixed binary protocol.
 - A minimal CLI client.
 - Async single-leader replication — **planned bonus branch only**; integration point documented here, not implemented on `main`.
@@ -153,6 +155,43 @@ rather than a key+value pair. See §7.1 for the exhaustive record table.
 - Appends a tombstone record. Idempotent.
 - Returns `nil` even if the key did not exist (no read-before-delete).
 - Tombstones are reclaimed by compaction (§7.3) after a grace period.
+
+### 4.6 `CompareAndSwap(key, expectValue, newValue, expectExists) → error`
+
+Conditional write for controllers that need to know whether the
+premise of their decision still holds. A plain read-then-`Put` sequence
+lets two local control processes silently overwrite each other: both
+read the same old value, both decide, and the second `Put` wins with no
+signal to the first. CAS collapses the check and the write into one
+writer step.
+
+- **Atomicity.** The precondition check and the append run on the
+  single writer goroutine with no other write between them, so all CAS
+  calls on one key are linearized. When two requests carry the same
+  old-value precondition and different new values, exactly one applies;
+  the other gets `ErrCASConflict`.
+- **Two distinct precondition shapes.** "Key does not exist" and "key
+  exists with an empty value" are different premises and must not be
+  conflated:
+  - `expectExists=false` (compare-and-create): applies only when the
+    key has no live value. `expectValue` must be nil.
+  - `expectExists=true` with a non-nil `expectValue`: applies only when
+    the key exists and its live value is byte-equal to `expectValue`.
+    An empty (non-nil) `expectValue` matches a live empty value, never
+    an absent key.
+- **Conflict is a normal unapplied result, not a failure.** On
+  `ErrCASConflict` no record is appended and the keydir is untouched
+  (the segment's byte count does not move). The caller re-reads the key
+  to learn the winning value and re-decides. After closing and
+  reopening the database, only the winning write is ever visible —
+  conflicts never existed on disk.
+- On success the write is an ordinary PUT record (§7.1); the
+  conditionality lives in the writer's pre-append check, not in a new
+  on-disk record kind, so recovery and compaction need no CAS-specific
+  handling. Durability follows the same `SyncOnPut` contract as `Put`
+  (§4.1).
+- Input validation mirrors `Put`: empty/oversize key or oversize value
+  is rejected before the precondition is evaluated.
 
 ## 5. Non-functional requirements
 

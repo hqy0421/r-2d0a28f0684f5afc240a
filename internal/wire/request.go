@@ -67,6 +67,26 @@ type PingRequest struct{}
 
 func (*PingRequest) Op() Op { return OpPing }
 
+// CASRequest carries a conditional write. Mode selects the precondition:
+//
+//   - CASIfAbsent: the write applies only when the key has no live value.
+//     Expected must be empty/nil.
+//   - CASIfValue: the write applies only when the key exists and its live
+//     value byte-equals Expected. An empty (non-nil) Expected matches a
+//     live empty value, never an absent key.
+//
+// NewValue is the value written when the precondition holds. The server
+// answers a failed precondition with StatusPreconditionFailed; the
+// connection stays alive and nothing was applied.
+type CASRequest struct {
+	Key      []byte
+	NewValue []byte
+	Expected []byte
+	Mode     CASMode
+}
+
+func (*CASRequest) Op() Op { return OpCAS }
+
 // StatsRequest carries a STATS command. Body is empty.
 type StatsRequest struct{}
 
@@ -105,6 +125,8 @@ func DecodeRequest(op Op, body []byte) (Request, error) {
 			return nil, asProtocolErr("PING: expected empty body, got %d bytes", len(body))
 		}
 		return &PingRequest{}, nil
+	case OpCAS:
+		return decodeCAS(body)
 	case OpStats:
 		if len(body) != 0 {
 			return nil, asProtocolErr("STATS: expected empty body, got %d bytes", len(body))
@@ -291,6 +313,70 @@ func decodeReadKeyRange(body []byte) (*ReadKeyRangeRequest, error) {
 	return req, nil
 }
 
+// decodeCAS parses a CAS body:
+//
+//	u32 klen | key | u8 mode | u32 vlen | newval | u32 elen | expect
+//
+// The absent-key and empty-value preconditions are kept distinct by the
+// mode byte: CASIfAbsent forbids any expected bytes, while CASIfValue
+// with elen=0 means "expect a live empty value".
+func decodeCAS(body []byte) (*CASRequest, error) {
+	if len(body) < minCASBodyBytes {
+		return nil, asProtocolErr("CAS: truncated body (have %d, want >=%d)", len(body), minCASBodyBytes)
+	}
+	klen := binary.BigEndian.Uint32(body[0:4])
+	if klen < 1 {
+		return nil, asProtocolErr("CAS: empty key")
+	}
+	if klen > MaxKeyLen {
+		return nil, asProtocolErr("CAS: key_len=%d exceeds max=%d", klen, MaxKeyLen)
+	}
+	keyEnd := 4 + int(klen)
+	if uint64(len(body)) < uint64(keyEnd)+1+4 {
+		return nil, asProtocolErr("CAS: truncated before new value header")
+	}
+	mode := CASMode(body[keyEnd])
+	if mode != CASIfAbsent && mode != CASIfValue {
+		return nil, asProtocolErr("CAS: unknown mode %d", mode)
+	}
+	vlenOff := keyEnd + 1
+	vlen := binary.BigEndian.Uint32(body[vlenOff : vlenOff+4])
+	if vlen > MaxValLen {
+		return nil, asProtocolErr("CAS: val_len=%d exceeds max=%d", vlen, MaxValLen)
+	}
+	newValOff := vlenOff + 4
+	if uint64(len(body)) < uint64(newValOff)+uint64(vlen)+4 {
+		return nil, asProtocolErr("CAS: truncated before expected-value header")
+	}
+	newVal := make([]byte, vlen)
+	copy(newVal, body[newValOff:newValOff+int(vlen)])
+	elenOff := newValOff + int(vlen)
+	elen := binary.BigEndian.Uint32(body[elenOff : elenOff+4])
+	if elen > MaxValLen {
+		return nil, asProtocolErr("CAS: expect_len=%d exceeds max=%d", elen, MaxValLen)
+	}
+	want := elenOff + 4 + int(elen)
+	if len(body) != want {
+		return nil, asProtocolErr("CAS: body length %d does not match (want %d)", len(body), want)
+	}
+	if mode == CASIfAbsent && elen != 0 {
+		return nil, asProtocolErr("CAS: if-absent mode requires expect_len=0, got %d", elen)
+	}
+	var expected []byte
+	if elen > 0 {
+		expected = make([]byte, elen)
+		copy(expected, body[elenOff+4:])
+	}
+	key := make([]byte, klen)
+	copy(key, body[4:keyEnd])
+	return &CASRequest{
+		Key:      key,
+		NewValue: newVal,
+		Expected: expected,
+		Mode:     mode,
+	}, nil
+}
+
 // EncodeRequest encodes a Request into a full frame (length-prefixed). This
 // is used by tests and clients; the server only decodes requests. Returns
 // an error if any field exceeds its wire limit.
@@ -326,6 +412,8 @@ func encodeRequestBody(req Request) ([]byte, error) {
 		return encodeBatch(r)
 	case *ReadKeyRangeRequest:
 		return encodeReadKeyRange(r)
+	case *CASRequest:
+		return encodeCAS(r)
 	case *PingRequest:
 		return nil, nil
 	case *StatsRequest:
@@ -418,6 +506,42 @@ func encodeReadKeyRange(r *ReadKeyRangeRequest) ([]byte, error) {
 	off := 4 + len(r.Start)
 	binary.BigEndian.PutUint32(buf[off:off+4], uint32(len(r.End)))
 	copy(buf[off+4:], r.End)
+	return buf, nil
+}
+
+// encodeCAS emits the CAS body documented on decodeCAS. Validation mirrors
+// the decoder so a client cannot encode a frame the server would reject.
+func encodeCAS(r *CASRequest) ([]byte, error) {
+	if err := checkKey(r.Key, "CAS"); err != nil {
+		return nil, err
+	}
+	if r.Mode != CASIfAbsent && r.Mode != CASIfValue {
+		return nil, asProtocolErr("CAS: unknown mode %d", r.Mode)
+	}
+	if len(r.NewValue) > MaxValLen {
+		return nil, asProtocolErr("CAS: val_len=%d exceeds max=%d", len(r.NewValue), MaxValLen)
+	}
+	if len(r.Expected) > MaxValLen {
+		return nil, asProtocolErr("CAS: expect_len=%d exceeds max=%d", len(r.Expected), MaxValLen)
+	}
+	if r.Mode == CASIfAbsent && len(r.Expected) != 0 {
+		return nil, asProtocolErr("CAS: if-absent mode requires an empty expected value")
+	}
+	size := 4 + len(r.Key) + 1 + 4 + len(r.NewValue) + 4 + len(r.Expected)
+	buf := make([]byte, size)
+	binary.BigEndian.PutUint32(buf[0:4], uint32(len(r.Key)))
+	off := 4
+	copy(buf[off:], r.Key)
+	off += len(r.Key)
+	buf[off] = uint8(r.Mode)
+	off++
+	binary.BigEndian.PutUint32(buf[off:off+4], uint32(len(r.NewValue)))
+	off += 4
+	copy(buf[off:], r.NewValue)
+	off += len(r.NewValue)
+	binary.BigEndian.PutUint32(buf[off:off+4], uint32(len(r.Expected)))
+	off += 4
+	copy(buf[off:], r.Expected)
 	return buf, nil
 }
 

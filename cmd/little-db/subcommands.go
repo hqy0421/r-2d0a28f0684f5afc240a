@@ -174,6 +174,13 @@ func classifyErr(err error, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "little-db: not found")
 		return exitNotFound
 	}
+	if errors.Is(err, client.ErrPreconditionFailed) {
+		// A failed conditional write is a normal unapplied result, not a
+		// server fault — give it its own exit code so shell scripts can
+		// branch on it distinctly from transport and usage failures.
+		fmt.Fprintln(stderr, "little-db: precondition failed")
+		return exitPreconditionFail
+	}
 	var re *wire.RemoteError
 	if errors.As(err, &re) {
 		fmt.Fprintf(stderr, "little-db: server returned %s: %s\n",
@@ -181,6 +188,8 @@ func classifyErr(err error, stderr io.Writer) int {
 		switch re.Status {
 		case wire.StatusNotFound:
 			return exitNotFound
+		case wire.StatusPreconditionFailed:
+			return exitPreconditionFail
 		case wire.StatusBadRequest, wire.StatusInternal:
 			return exitRemoteBad
 		case wire.StatusOverload, wire.StatusClosed:
@@ -217,6 +226,8 @@ func statusName(s wire.Status) string {
 		return "CLOSED"
 	case wire.StatusOverload:
 		return "OVERLOAD"
+	case wire.StatusPreconditionFailed:
+		return "PRECONDITION_FAILED"
 	default:
 		return fmt.Sprintf("status(0x%02x)", uint8(s))
 	}
@@ -420,6 +431,145 @@ func runDelete(args []string, stderr io.Writer) int {
 		return code
 	}
 	fmt.Fprintf(stderr, "OK delete key=%d\n", len(key))
+	return exitOK
+}
+
+// ---------------------------------------------------------------------
+// cas
+// ---------------------------------------------------------------------
+
+// runCAS implements a conditional write with two explicit precondition
+// shapes that the user must pick between, mirroring the engine's
+// distinction between "key absent" and "key present with an empty
+// value":
+//
+//   - --if-absent: apply NEW_VALUE only when the key does not exist.
+//     No EXPECTED positional is taken.
+//   - --if-eq EXPECTED (default when neither flag is given): apply
+//     NEW_VALUE only when the live value byte-equals EXPECTED. An
+//     empty-string EXPECTED matches a live empty value, never an
+//     absent key.
+//
+// A failed precondition is not an error: the command exits
+// exitPreconditionFail (6) after the server confirms nothing was
+// applied. Shell scripts can branch on that code.
+func runCAS(args []string, stdin io.Reader, stderr io.Writer) int {
+	fs := flag.NewFlagSet("cas", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	co := registerConnFlags(fs)
+	keyHex := fs.Bool("key-hex", false, "treat KEY positional as hex")
+	valHex := fs.Bool("value-hex", false, "treat VALUE/EXPECTED positional args as hex")
+	valStdin := fs.Bool("value-stdin", false,
+		"read NEW_VALUE bytes from stdin (raw, no decoding)")
+	ifAbsent := fs.Bool("if-absent", false,
+		"apply only when KEY does not exist (no EXPECTED positional)")
+	if err := parseFlags(fs, args); err != nil {
+		return exitUsage
+	}
+	if *valStdin && *valHex {
+		fmt.Fprintln(stderr, "cas: --value-stdin and --value-hex are mutually exclusive")
+		return exitUsage
+	}
+	// Positional layout:
+	//   --if-absent --value-stdin        → KEY
+	//   --if-absent                      → KEY NEW_VALUE
+	//   --value-stdin (value-based)      → KEY EXPECTED
+	//   default (value-based)            → KEY EXPECTED NEW_VALUE
+	wantArgs := 3
+	switch {
+	case *ifAbsent && *valStdin:
+		wantArgs = 1
+	case *ifAbsent || *valStdin:
+		wantArgs = 2
+	}
+	if fs.NArg() != wantArgs {
+		switch {
+		case *ifAbsent && *valStdin:
+			fmt.Fprintln(stderr, "cas --if-absent --value-stdin: expected KEY (new value comes from stdin)")
+		case *ifAbsent:
+			fmt.Fprintln(stderr, "cas --if-absent: expected KEY NEW_VALUE")
+		case *valStdin:
+			fmt.Fprintln(stderr, "cas --value-stdin: expected KEY EXPECTED (new value comes from stdin)")
+		default:
+			fmt.Fprintln(stderr, "cas: expected KEY EXPECTED NEW_VALUE")
+		}
+		return exitUsage
+	}
+
+	key, err := decodeArg(fs.Arg(0), *keyHex, "key")
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return exitUsage
+	}
+	if err := validateKey(key, "key"); err != nil {
+		fmt.Fprintln(stderr, "cas:", err)
+		return exitUsage
+	}
+
+	var expect, newVal []byte
+	if *ifAbsent {
+		// expect stays nil; the new value is either stdin or the second
+		// positional.
+		if *valStdin {
+			newVal, err = io.ReadAll(io.LimitReader(stdin, int64(wire.MaxValLen)+1))
+			if err != nil {
+				fmt.Fprintf(stderr, "cas --value-stdin: read: %v\n", err)
+				return exitTransport
+			}
+		} else {
+			newVal, err = decodeArg(fs.Arg(1), *valHex, "new value")
+			if err != nil {
+				fmt.Fprintln(stderr, err)
+				return exitUsage
+			}
+		}
+	} else {
+		// Value-based precondition: KEY EXPECTED [NEW_VALUE positional],
+		// or KEY EXPECTED with NEW_VALUE streamed via stdin.
+		expect, err = decodeArg(fs.Arg(1), *valHex, "expected value")
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return exitUsage
+		}
+		if *valStdin {
+			newVal, err = io.ReadAll(io.LimitReader(stdin, int64(wire.MaxValLen)+1))
+			if err != nil {
+				fmt.Fprintf(stderr, "cas --value-stdin: read: %v\n", err)
+				return exitTransport
+			}
+		} else {
+			newVal, err = decodeArg(fs.Arg(2), *valHex, "new value")
+			if err != nil {
+				fmt.Fprintln(stderr, err)
+				return exitUsage
+			}
+		}
+	}
+	if err := validateValue(newVal, "new value"); err != nil {
+		fmt.Fprintln(stderr, "cas:", err)
+		return exitUsage
+	}
+	if err := validateValue(expect, "expected value"); err != nil {
+		fmt.Fprintln(stderr, "cas:", err)
+		return exitUsage
+	}
+
+	c, code := dialClient(co, stderr)
+	if code != exitOK {
+		return code
+	}
+	defer c.Close()
+
+	if *ifAbsent {
+		if code := classifyErr(c.PutIfAbsent(key, newVal), stderr); code != exitOK {
+			return code
+		}
+	} else {
+		if code := classifyErr(c.CompareAndSwap(key, expect, newVal), stderr); code != exitOK {
+			return code
+		}
+	}
+	fmt.Fprintf(stderr, "OK cas applied key=%d newval=%d\n", len(key), len(newVal))
 	return exitOK
 }
 

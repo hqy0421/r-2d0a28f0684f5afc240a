@@ -105,6 +105,15 @@ var (
 	// restart — Open's sweepOrphans will reconcile whichever side of
 	// the rename survived.
 	ErrWritesDisabled = errors.New("engine: writes disabled (manifest durability uncertain)")
+
+	// ErrCASConflict is returned by CompareAndSwap when the key's
+	// current state does not match the caller's precondition. It is a
+	// normal, expected outcome of a conditional write — not an I/O or
+	// durability failure — and callers should treat it as control flow
+	// (typically: re-read the current value and retry, or give up). No
+	// bytes are appended and the keydir is untouched when this error is
+	// returned.
+	ErrCASConflict = errors.New("engine: compare-and-swap precondition not met")
 )
 
 // BatchEntry is one operation inside a BatchPut. A non-Delete entry writes
@@ -180,20 +189,25 @@ const (
 	writeKindDelete
 	writeKindBatch
 	writeKindCompactCommit
+	writeKindCAS
 )
 
 // writeRequest is one in-flight mutating operation sent from a caller
 // goroutine to the writer goroutine. The reply channel has capacity 1 so the
 // writer never blocks publishing a result. For Put/Delete, key/value carry
 // the operands. For Batch, entries carries the whole batch and key/value are
-// unused.
+// unused. For CAS (writeKindCAS), key/value carry the new write and
+// expectExists/expectValue carry the precondition the writer must verify
+// atomically before appending.
 type writeRequest struct {
-	kind    writeKind
-	key     []byte
-	value   []byte
-	entries []BatchEntry
-	compact *compactCommit // non-nil only for writeKindCompactCommit
-	reply   chan error
+	kind         writeKind
+	key          []byte
+	value        []byte
+	entries      []BatchEntry
+	compact      *compactCommit // non-nil only for writeKindCompactCommit
+	expectExists bool
+	expectValue  []byte
+	reply        chan error
 }
 
 // DB is the storage engine handle. Safe for concurrent use.
@@ -702,6 +716,53 @@ func (db *DB) Put(key, value []byte) error {
 	return db.submit(req)
 }
 
+// CompareAndSwap conditionally writes newValue for key. It is the
+// atomic read-check-write primitive two independent controllers need so
+// that a decision made from a previously observed value cannot silently
+// overwrite a decision another writer committed in the meantime. The
+// check and the append happen in one step on the single writer
+// goroutine: no other write can land between the precondition check and
+// the keydir publish, so every concurrent CompareAndSwap on the same key
+// is linearized — when two requests carry the same old-value
+// precondition but different new values, exactly one applies.
+//
+// Preconditions (the two shapes are deliberately distinct — "key does
+// not exist" and "key exists holding an empty value" must not be
+// conflated, because both nil and empty []byte are legitimate stored
+// values for Put):
+//
+//   - expectExists=false: applies only when the key currently has no
+//     live value (never written, or deleted). expectValue must be nil.
+//     This is the compare-and-create ("insert if absent") shape.
+//   - expectExists=true with non-nil expectValue: applies only when the
+//     key exists and its current value is byte-equal to expectValue.
+//     An empty (non-nil) expectValue therefore matches specifically a
+//     live key whose value is the empty string — never a missing key.
+//
+// On success the new record is appended exactly as Put would and nil is
+// returned. If the precondition no longer holds, ErrCASConflict is
+// returned: nothing is appended, the keydir is unchanged, and a reopen
+// of the database still shows the winning writer's value. A conflict is
+// a normal unapplied result, not an error condition worth retrying
+// blindly; callers typically re-read the key and re-decide.
+func (db *DB) CompareAndSwap(key, expectValue, newValue []byte, expectExists bool) error {
+	if err := validateKeyValue(key, newValue); err != nil {
+		return err
+	}
+	if !expectExists && expectValue != nil {
+		return errors.New("engine: CompareAndSwap: expectValue must be nil when expectExists=false")
+	}
+	req := &writeRequest{
+		kind:         writeKindCAS,
+		key:          key,
+		value:        newValue,
+		expectExists: expectExists,
+		expectValue:  expectValue,
+		reply:        make(chan error, 1),
+	}
+	return db.submit(req)
+}
+
 // Delete writes a tombstone for key. Idempotent: deleting a missing key is a
 // no-op from the caller's perspective, but a tombstone is still appended so
 // the deletion is durable and replicable.
@@ -1085,11 +1146,23 @@ func (db *DB) handleOne(req *writeRequest) (bool, error) {
 		// it does not touch the active segment, so appendedActive=false.
 		return false, db.handleCompactCommit(req.compact)
 	}
+	if req.kind == writeKindCAS {
+		// Verify the precondition atomically on the writer before any
+		// append. The writer is the sole keydir mutator, so nothing can
+		// change the key between this check and the keydir publish below.
+		// A conflict returns without touching disk or the keydir.
+		if err := db.checkCASPrecondition(req); err != nil {
+			return false, err
+		}
+	}
 	rec := record{
 		key: req.key,
 	}
 	switch req.kind {
-	case writeKindPut:
+	case writeKindPut, writeKindCAS:
+		// A CAS that passed its precondition is appended as an ordinary
+		// PUT record; the conditionality lives in the check above, not
+		// in the on-disk format.
 		rec.flag = recordFlagPut
 		rec.value = req.value
 	case writeKindDelete:
@@ -1152,6 +1225,57 @@ func (db *DB) handleOne(req *writeRequest) (bool, error) {
 		})
 	}
 	return true, nil
+}
+
+// checkCASPrecondition verifies a writeKindCAS request's precondition
+// against the live keydir. It runs only on the writer goroutine, which
+// is the sole keydir mutator, so a successful check cannot be invalidated
+// by another write before the caller's own append and keydir publish in
+// handleOne — the whole check-and-write sequence is one writer step.
+//
+// The RLock mirrors Get's discipline: it keeps the keydir lookup and the
+// value pread consistent with a concurrent handleCompactCommit (which
+// performs its keydir/segments swap under the write lock). Reading the
+// current value adds one pread to a contended CAS; that is unavoidable,
+// since the precondition is a value comparison rather than an entry
+// identity comparison.
+//
+// Returns nil when the precondition holds, ErrCASConflict otherwise.
+func (db *DB) checkCASPrecondition(req *writeRequest) error {
+	db.segmentsMu.RLock()
+	defer db.segmentsMu.RUnlock()
+
+	entry, ok := db.keydir.get(req.key)
+	if !req.expectExists {
+		// Insert-if-absent: any live entry (including an empty-value
+		// one) violates the precondition.
+		if ok {
+			return ErrCASConflict
+		}
+		return nil
+	}
+	if !ok {
+		// Expected a specific present value; the key is absent (or
+		// deleted). This is a conflict even when expectValue is empty.
+		return ErrCASConflict
+	}
+	seg, ok := db.segments[entry.fileID]
+	if !ok {
+		// Defensive: unreachable while holding segmentsMu.RLock, since
+		// segment removal happens under segmentsMu.Lock. Report a
+		// conflict rather than panic; the caller may re-read and retry.
+		return ErrCASConflict
+	}
+	current := make([]byte, entry.valueLen)
+	if entry.valueLen > 0 {
+		if err := seg.readAt(current, entry.valuePos); err != nil {
+			return fmt.Errorf("engine: compare-and-swap read current value: %w", err)
+		}
+	}
+	if !bytes.Equal(current, req.expectValue) {
+		return ErrCASConflict
+	}
+	return nil
 }
 
 // handleBatch is the writer-side append path for BatchPut. Same ownership

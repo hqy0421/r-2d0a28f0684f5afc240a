@@ -23,6 +23,7 @@ day-2 operations (sizing, fsync, restart) see [ops.md](ops.md).
    - [`put`](#put)
    - [`get`](#get)
    - [`delete`](#delete)
+   - [`cas`](#cas)
    - [`range`](#range)
    - [`batch`](#batch)
    - [`stats`](#stats)
@@ -134,6 +135,7 @@ a connection.
 |  `3` | Server returned `BAD_REQUEST` or `INTERNAL`.                                                   |
 |  `4` | `NOT_FOUND` (only `get` returns this from a successful round trip).                            |
 |  `5` | Server returned `OVERLOAD` or `CLOSED` (back off and retry).                                   |
+|  `6` | `cas` precondition failed — a normal unapplied conditional write; nothing was changed.         |
 
 All non-zero exits write a human-readable diagnostic to **stderr**.
 
@@ -306,6 +308,68 @@ On success, writes `OK delete key=<klen>` to **stderr** and exits `0`.
 ```bash
 little-db delete user:3
 little-db delete --key-hex deadbeef
+```
+
+---
+
+## `cas`
+
+Conditionally write a key. Use this when two controllers might update
+the same key: the write applies only if the key still matches the
+premise you observed, so a decision made from stale data is refused
+instead of silently overwriting the other writer's decision.
+
+### Synopsis
+
+```bash
+# Value-based: apply NEW_VALUE only when the live value equals EXPECTED.
+little-db cas [global flags] [--key-hex] [--value-hex] KEY EXPECTED NEW_VALUE
+little-db cas [global flags] --value-stdin KEY EXPECTED < FILE
+
+# Compare-and-create: apply NEW_VALUE only when KEY does not exist.
+little-db cas [global flags] --if-absent [--key-hex] [--value-hex] KEY NEW_VALUE
+little-db cas [global flags] --if-absent --value-stdin KEY < FILE
+```
+
+### Flags
+
+| Flag            | Meaning                                                                                                                                  |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `--if-absent`   | Precondition is "key has no live value"; no `EXPECTED` positional is taken. Without it, the precondition is value equality on `EXPECTED`. |
+| `--key-hex`     | Treat `KEY` as a hex string and decode it.                                                                                               |
+| `--value-hex`   | Treat `EXPECTED` / `NEW_VALUE` positionals as hex strings. Mutually exclusive with `--value-stdin`.                                     |
+| `--value-stdin` | Read `NEW_VALUE` bytes from stdin (raw, no decoding).                                                                                    |
+
+### Precondition semantics
+
+The two premises "key does not exist" and "key exists holding an empty
+value" are deliberately distinct:
+
+- `cas --if-absent k v` succeeds only when `k` is absent. A live empty
+  value makes it fail.
+- `cas k "" v` (value mode, empty `EXPECTED`) succeeds only when `k`
+  exists and its value is empty. An absent key makes it fail.
+
+### Exit codes
+
+- `0` — the conditional write was applied.
+- `6` — the precondition did not hold; the server changed nothing and
+  the connection stays usable. Re-run `get` to inspect the winning value.
+- Other codes follow the [global table](#exit-codes).
+
+### Examples
+
+```bash
+# Flip a switch only if nobody changed it since we last read "off".
+little-db cas switch off on
+#   OK cas applied key=6 newval=2          # exit 0 — we won
+#   little-db: precondition failed         # exit 6 — another writer won
+
+# Create a singleton row without clobbering an existing one.
+little-db cas --if-absent job:lock owner-7
+
+# Binary expected/new values.
+little-db cas --value-hex 0102 00ff 00fe
 ```
 
 ---

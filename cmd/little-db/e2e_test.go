@@ -232,6 +232,129 @@ func TestE2ETransportErrorOnBadAddr(t *testing.T) {
 	}
 }
 
+// TestE2ECAS exercises the conditional-write subcommand end to end,
+// including the distinct absent vs present-empty preconditions and the
+// dedicated exit code 6 for a normal unapplied result.
+func TestE2ECAS(t *testing.T) {
+	addr := startTestServer(t)
+	args := func(rest ...string) []string {
+		return append([]string{rest[0], "--addr", addr}, rest[1:]...)
+	}
+
+	// if-eq on an absent key fails with exit 6 and creates nothing.
+	_, errb, code := invoke(args("cas", "sw", "old", "on"), "")
+	if code != exitPreconditionFail {
+		t.Fatalf("absent if-eq: code=%d stderr=%q want 6", code, errb)
+	}
+	_, _, code = invoke(args("get", "sw"), "")
+	if code != exitNotFound {
+		t.Fatalf("key should remain absent, code=%d", code)
+	}
+
+	// if-absent creates the key.
+	_, errb, code = invoke(args("cas", "--if-absent", "sw", "v1"), "")
+	if code != exitOK {
+		t.Fatalf("if-absent create: code=%d stderr=%q", code, errb)
+	}
+	out, _, code := invoke(args("get", "sw"), "")
+	if code != exitOK || out != "v1" {
+		t.Fatalf("get after create: out=%q code=%d", out, code)
+	}
+
+	// A second if-absent conflicts, even against an empty value later.
+	_, _, code = invoke(args("cas", "--if-absent", "sw", "v2"), "")
+	if code != exitPreconditionFail {
+		t.Fatalf("second if-absent: code=%d want 6", code)
+	}
+	out, _, _ = invoke(args("get", "sw"), "")
+	if out != "v1" {
+		t.Fatalf("value changed by losing if-absent: %q", out)
+	}
+
+	// if-eq with the current value applies.
+	_, errb, code = invoke(args("cas", "sw", "v1", "v2"), "")
+	if code != exitOK {
+		t.Fatalf("if-eq apply: code=%d stderr=%q", code, errb)
+	}
+	out, _, _ = invoke(args("get", "sw"), "")
+	if out != "v2" {
+		t.Fatalf("get after swap: %q", out)
+	}
+
+	// Stale expect is refused with exit 6 and leaves the winner in place.
+	_, _, code = invoke(args("cas", "sw", "v1", "v3"), "")
+	if code != exitPreconditionFail {
+		t.Fatalf("stale if-eq: code=%d want 6", code)
+	}
+	out, _, _ = invoke(args("get", "sw"), "")
+	if out != "v2" {
+		t.Fatalf("value changed by losing if-eq: %q", out)
+	}
+
+	// Present-empty vs absent: store an empty value, then an empty
+	// expected value must match it; if-absent must still fail.
+	if _, _, code = invoke(args("put", "empty", ""), ""); code != exitOK {
+		t.Fatalf("seed empty put: code=%d", code)
+	}
+	_, _, code = invoke(args("cas", "empty", "", "filled"), "")
+	if code != exitOK {
+		t.Fatalf("if-eq empty->filled: code=%d want 0", code)
+	}
+	out, _, _ = invoke(args("get", "empty"), "")
+	if out != "filled" {
+		t.Fatalf("empty->filled get: %q", out)
+	}
+
+	// Usage errors stay exit 2, including the wrong positional arity.
+	for _, tc := range [][]string{
+		{"cas"},
+		{"cas", "only-one"},
+		{"cas", "--if-absent"},
+		{"cas", "a", "b", "c", "d"},
+	} {
+		_, _, code := invoke(args(tc...), "")
+		if code != exitUsage {
+			t.Fatalf("cas %v: code=%d want exitUsage", tc, code)
+		}
+	}
+}
+
+// TestE2ECASValueStdin covers streaming the new value, for both
+// precondition shapes.
+func TestE2ECASValueStdin(t *testing.T) {
+	addr := startTestServer(t)
+
+	// if-absent + stdin: KEY only.
+	_, errb, code := invoke([]string{"cas", "--addr", addr, "--if-absent", "--value-stdin", "big"}, "streamed")
+	if code != exitOK {
+		t.Fatalf("if-absent stdin: code=%d stderr=%q", code, errb)
+	}
+	out, _, _ := invoke([]string{"get", "--addr", addr, "big"}, "")
+	if out != "streamed" {
+		t.Fatalf("get: %q", out)
+	}
+
+	// if-eq + stdin: KEY EXPECTED, new value from stdin.
+	_, errb, code = invoke([]string{"cas", "--addr", addr, "--value-stdin", "big", "streamed"}, "next")
+	if code != exitOK {
+		t.Fatalf("if-eq stdin: code=%d stderr=%q", code, errb)
+	}
+	out, _, _ = invoke([]string{"get", "--addr", addr, "big"}, "")
+	if out != "next" {
+		t.Fatalf("get after stdin cas: %q", out)
+	}
+
+	// Conflict over stdin still returns exit 6 and keeps the winner.
+	_, _, code = invoke([]string{"cas", "--addr", addr, "--value-stdin", "big", "streamed"}, "ignored")
+	if code != exitPreconditionFail {
+		t.Fatalf("stdin conflict: code=%d want 6", code)
+	}
+	out, _, _ = invoke([]string{"get", "--addr", addr, "big"}, "")
+	if out != "next" {
+		t.Fatalf("value after stdin conflict: %q", out)
+	}
+}
+
 // TestE2EPrevalidationExitCodes pins the fix for the medium finding:
 // local request-shape errors (empty key, oversize key/value) must exit
 // with exitUsage (2), not exitTransport (1). The CLI must not dial.

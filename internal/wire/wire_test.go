@@ -166,6 +166,12 @@ func requestsEqual(a, b Request) bool {
 	case *ReadKeyRangeRequest:
 		br, ok := b.(*ReadKeyRangeRequest)
 		return ok && bytes.Equal(ar.Start, br.Start) && bytes.Equal(ar.End, br.End)
+	case *CASRequest:
+		br, ok := b.(*CASRequest)
+		return ok && ar.Mode == br.Mode &&
+			bytes.Equal(ar.Key, br.Key) &&
+			bytes.Equal(ar.NewValue, br.NewValue) &&
+			bytes.Equal(ar.Expected, br.Expected)
 	case *PingRequest:
 		_, ok := b.(*PingRequest)
 		return ok

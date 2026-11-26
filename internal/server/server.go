@@ -323,6 +323,8 @@ func reqMeta(req wire.Request) (op string, keyLen, valLen, entries int) {
 		return "stats", 0, 0, 0
 	case *wire.ReadKeyRangeRequest:
 		return "range", len(r.Start) + len(r.End), 0, 0
+	case *wire.CASRequest:
+		return "cas", len(r.Key), len(r.NewValue), 0
 	default:
 		return "unknown", 0, 0, 0
 	}
@@ -435,6 +437,18 @@ func (s *Server) dispatchOnce(conn net.Conn, req wire.Request) (wire.Status, err
 
 	case *wire.ReadKeyRangeRequest:
 		return s.handleRange(conn, r)
+
+	case *wire.CASRequest:
+		exists := r.Mode == wire.CASIfValue
+		err := s.db.CompareAndSwap(r.Key, r.Expected, r.NewValue, exists)
+		if err != nil {
+			if errors.Is(err, engine.ErrCASConflict) {
+				return wire.StatusPreconditionFailed,
+					s.writeError(conn, wire.StatusPreconditionFailed, "cas precondition not met")
+			}
+			return s.writeEngineErr(conn, err)
+		}
+		return wire.StatusOK, s.writeFrame(conn, uint8(wire.StatusOK), nil)
 	}
 	// Unknown concrete type; defensive.
 	return wire.StatusInternal, s.writeError(conn, wire.StatusInternal, "unknown request type")
@@ -555,6 +569,12 @@ func classifyEngineErr(err error) (wire.Status, string) {
 	switch {
 	case errors.Is(err, engine.ErrKeyNotFound):
 		return wire.StatusNotFound, ""
+	case errors.Is(err, engine.ErrCASConflict):
+		// Normal unapplied conditional write — the precondition did not
+		// hold at commit time. dispatchOnce also special-cases this before
+		// calling writeEngineErr, but keep the mapping here so the
+		// classifier stays the exhaustive engine-to-wire table.
+		return wire.StatusPreconditionFailed, err.Error()
 	case errors.Is(err, engine.ErrDBClosed):
 		return wire.StatusClosed, err.Error()
 	case errors.Is(err, engine.ErrWritesDisabled):

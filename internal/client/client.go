@@ -54,6 +54,13 @@ const (
 // key is a successful no-op per the engine contract.
 var ErrNotFound = errors.New("client: key not found")
 
+// ErrPreconditionFailed is the sentinel returned by CompareAndSwap /
+// PutIfAbsent when the server reports the CAS precondition did not hold.
+// It is a normal unapplied result: no write landed, and the caller can
+// re-read the key to learn the winning value. Transport and other
+// server-side failures still surface as their own error types.
+var ErrPreconditionFailed = errors.New("client: cas precondition failed")
+
 // Options configures Dial.
 type Options struct {
 	// DialTimeout caps how long Dial may block waiting for the TCP
@@ -214,6 +221,48 @@ func (c *Client) Delete(key []byte) error {
 	status, body, err := c.roundTripUnary(&wire.DeleteRequest{Key: key})
 	if err != nil {
 		return err
+	}
+	return statusToErr(status, body)
+}
+
+// CompareAndSwap conditionally writes newValue for key, applying only if
+// the key currently exists and its value byte-equals expect. An empty
+// (non-nil) expect matches a live empty value specifically — never an
+// absent key. Returns ErrPreconditionFailed when the precondition no
+// longer holds (the write was not applied), or *wire.RemoteError for
+// other server-side failures.
+func (c *Client) CompareAndSwap(key, expect, newValue []byte) error {
+	status, body, err := c.roundTripUnary(&wire.CASRequest{
+		Key:      key,
+		NewValue: newValue,
+		Expected: expect,
+		Mode:     wire.CASIfValue,
+	})
+	if err != nil {
+		return err
+	}
+	if status == wire.StatusPreconditionFailed {
+		return ErrPreconditionFailed
+	}
+	return statusToErr(status, body)
+}
+
+// PutIfAbsent writes value for key only when the key currently has no
+// live value (compare-and-create). Returns ErrPreconditionFailed if the
+// key already exists, including when its live value is empty — absent
+// and present-empty are distinct preconditions.
+func (c *Client) PutIfAbsent(key, value []byte) error {
+	status, body, err := c.roundTripUnary(&wire.CASRequest{
+		Key:      key,
+		NewValue: value,
+		Expected: nil,
+		Mode:     wire.CASIfAbsent,
+	})
+	if err != nil {
+		return err
+	}
+	if status == wire.StatusPreconditionFailed {
+		return ErrPreconditionFailed
 	}
 	return statusToErr(status, body)
 }
